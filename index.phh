@@ -1,0 +1,1192 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * Universal PUBG Tournament Bot (single-file)
+ * PHP 8+
+ */
+
+// =========================
+// CONFIG
+// =========================
+$BOT_TOKEN = 'PASTE_TOKEN_HERE';
+$BOT_USERNAME = 'PASTE_BOT_USERNAME_HERE'; // without @
+$REQUIRED_CHANNELS = ['@channel1', '@channel2'];
+$ADMINS = [111111111, 222222222];
+$SUPPORT_USERNAME = '@YourSupport';
+
+$BASE_DIR = __DIR__;
+$DATA_DIR = $BASE_DIR . '/data';
+
+$FILES = [
+    'users' => $DATA_DIR . '/users.json',
+    'steps' => $DATA_DIR . '/steps.json',
+    'referrals' => $DATA_DIR . '/referrals.json',
+    'squads' => $DATA_DIR . '/squads.json',
+    'squad_members' => $DATA_DIR . '/squad_members.json',
+    'events' => $DATA_DIR . '/events.json',
+    'participants' => $DATA_DIR . '/participants.json',
+    'scores' => $DATA_DIR . '/scores.json',
+    'log' => $BASE_DIR . '/log.txt',
+];
+
+// =========================
+// BOOTSTRAP
+// =========================
+ensureStorage($DATA_DIR, $FILES);
+
+$update = json_decode(file_get_contents('php://input') ?: '{}', true);
+if (!is_array($update)) {
+    logLine($FILES['log'], 'Invalid update payload');
+    http_response_code(200);
+    exit('OK');
+}
+
+try {
+    handleUpdate($update, $BOT_TOKEN, $BOT_USERNAME, $REQUIRED_CHANNELS, $ADMINS, $SUPPORT_USERNAME, $FILES);
+} catch (Throwable $e) {
+    logLine($FILES['log'], 'Unhandled exception: ' . $e->getMessage());
+}
+
+http_response_code(200);
+echo 'OK';
+
+// =========================
+// HANDLER
+// =========================
+function handleUpdate(array $update, string $token, string $botUsername, array $requiredChannels, array $admins, string $supportUsername, array $files): void
+{
+    $users = readJson($files['users']);
+    $steps = readJson($files['steps']);
+    $referrals = readJson($files['referrals']);
+    $squads = readJson($files['squads']);
+    $squadMembers = readJson($files['squad_members']);
+    $events = readJson($files['events']);
+    $participants = readJson($files['participants']);
+    $scores = readJson($files['scores']);
+
+    if (isset($update['message'])) {
+        $m = $update['message'];
+        $chatId = (int)($m['chat']['id'] ?? 0);
+        $from = $m['from'] ?? [];
+        $userId = (int)($from['id'] ?? 0);
+        $text = trim((string)($m['text'] ?? ''));
+        if ($chatId <= 0 || $userId <= 0) {
+            return;
+        }
+
+        ensureUser($users, $userId, $from);
+
+        if (str_starts_with($text, '/start')) {
+            $payload = trim(str_replace('/start', '', $text));
+            handleStart($chatId, $userId, $from, $payload, $token, $botUsername, $requiredChannels, $admins, $supportUsername, $users, $steps, $referrals, $squads, $squadMembers, $files);
+            writeJson($files['users'], $users);
+            writeJson($files['steps'], $steps);
+            writeJson($files['referrals'], $referrals);
+            return;
+        }
+
+        if ($text === '/admin') {
+            if (isAdmin($userId, $admins)) {
+                sendAdminPanel($token, $chatId);
+            } else {
+                tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Siz admin emassiz.']);
+            }
+            return;
+        }
+
+        handleStepInput($token, $chatId, $userId, $text, $botUsername, $requiredChannels, $admins, $supportUsername, $users, $steps, $squads, $squadMembers, $events, $participants, $scores, $files);
+        writeJson($files['users'], $users);
+        writeJson($files['steps'], $steps);
+        writeJson($files['squads'], $squads);
+        writeJson($files['squad_members'], $squadMembers);
+        writeJson($files['events'], $events);
+        writeJson($files['participants'], $participants);
+        writeJson($files['scores'], $scores);
+        return;
+    }
+
+    if (isset($update['callback_query'])) {
+        $cq = $update['callback_query'];
+        $data = (string)($cq['data'] ?? '');
+        $cqId = (string)($cq['id'] ?? '');
+        $from = $cq['from'] ?? [];
+        $userId = (int)($from['id'] ?? 0);
+        $message = $cq['message'] ?? [];
+        $chatId = (int)($message['chat']['id'] ?? 0);
+        $msgId = (int)($message['message_id'] ?? 0);
+        if ($userId <= 0 || $chatId <= 0 || $msgId <= 0) {
+            return;
+        }
+
+        ensureUser($users, $userId, $from);
+        answerCb($token, $cqId);
+
+        handleCallback($token, $chatId, $msgId, $userId, $data, $botUsername, $requiredChannels, $admins, $supportUsername, $users, $steps, $squads, $squadMembers, $events, $participants, $scores, $files);
+
+        writeJson($files['users'], $users);
+        writeJson($files['steps'], $steps);
+        writeJson($files['squads'], $squads);
+        writeJson($files['squad_members'], $squadMembers);
+        writeJson($files['events'], $events);
+        writeJson($files['participants'], $participants);
+        writeJson($files['scores'], $scores);
+        writeJson($files['referrals'], $referrals);
+    }
+}
+
+function handleStart(int $chatId, int $userId, array $from, string $payload, string $token, string $botUsername, array $requiredChannels, array $admins, string $supportUsername, array &$users, array &$steps, array &$referrals, array &$squads, array &$squadMembers, array $files): void
+{
+    $isNew = !isset($users[(string)$userId]);
+    ensureUser($users, $userId, $from);
+
+    if ($payload !== '') {
+        $payload = ltrim($payload);
+        if (str_starts_with($payload, 'ref_') && $isNew) {
+            $refId = (int)substr($payload, 4);
+            if ($refId > 0 && $refId !== $userId && isset($users[(string)$refId]) && !isset($referrals[(string)$userId])) {
+                $referrals[(string)$userId] = $refId;
+                $users[(string)$userId]['referral_by'] = $refId;
+                $users[(string)$refId]['referral_count'] = (int)($users[(string)$refId]['referral_count'] ?? 0) + 1;
+                $users[(string)$refId]['eligible'] = ((int)$users[(string)$refId]['referral_count'] >= 3);
+            }
+        }
+
+        if (str_starts_with($payload, 'sq_')) {
+            $code = trim(substr($payload, 3));
+            $squadId = findSquadByCode($code, $squads);
+            if ($squadId !== null) {
+                $steps[(string)$userId] = ['step' => 'squad_join_pubg_id', 'temp' => ['join_code' => $code, 'squad_id' => $squadId]];
+                tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => "Squad topildi. PUBG ID kiriting:"]);
+            }
+        }
+    }
+
+    if (!ensureSubscribed($token, $userId, $requiredChannels)) {
+        sendSubscribeGate($token, $chatId, $requiredChannels);
+        return;
+    }
+
+    clearStep($steps, $userId);
+    sendMainMenu($token, $chatId, $userId, $admins);
+}
+
+function handleStepInput(string $token, int $chatId, int $userId, string $text, string $botUsername, array $requiredChannels, array $admins, string $supportUsername, array &$users, array &$steps, array &$squads, array &$squadMembers, array &$events, array &$participants, array &$scores, array $files): void
+{
+    $state = $steps[(string)$userId] ?? ['step' => null, 'temp' => []];
+    $step = $state['step'] ?? null;
+    $temp = $state['temp'] ?? [];
+
+    if (!$step) {
+        tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Menyudan foydalaning.', 'reply_markup' => mainMenuKb(isAdmin($userId, $admins))]);
+        return;
+    }
+
+    $text = sanitizeText($text);
+
+    switch ($step) {
+        case 'enter_event_code':
+            $code = strtoupper($text);
+            if (!isset($events[$code])) {
+                tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Event topilmadi.']);
+                return;
+            }
+            $event = $events[$code];
+            if (($event['status'] ?? '') !== 'OPEN') {
+                tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Bu event OPEN holatda emas.']);
+                return;
+            }
+            $mySquadId = userSquadId($userId, $squadMembers);
+            if ($mySquadId === null) {
+                tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Avval squad yarating yoki qo‘shiling.', 'reply_markup' => kb([[['text' => '👥 Squad', 'callback_data' => 'm_squad']]])]);
+                return;
+            }
+            $membersCount = count($squadMembers[$mySquadId]['members'] ?? []);
+            if ($membersCount < 4) {
+                tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Squad 4 ta odam bo‘lishi shart.', 'reply_markup' => kb([[['text' => '👥 Squad', 'callback_data' => 'm_squad']]])]);
+                return;
+            }
+            $participants[$code] = $participants[$code] ?? ['squads' => []];
+            if (isset($participants[$code]['squads'][$mySquadId])) {
+                tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Squad allaqachon ro‘yxatdan o‘tgan.']);
+                clearStep($steps, $userId);
+                return;
+            }
+            $limit = (int)($event['limit_squads'] ?? 16);
+            if (count($participants[$code]['squads']) >= $limit) {
+                tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Joylar to‘lgan.']);
+                clearStep($steps, $userId);
+                return;
+            }
+            $participants[$code]['squads'][$mySquadId] = [
+                'squad_id' => $mySquadId,
+                'captain_id' => (int)($squads[$mySquadId]['captain_id'] ?? 0),
+                'squad_name_snapshot' => (string)($squads[$mySquadId]['name'] ?? 'Unknown'),
+                'registered_at' => now(),
+                'approved' => true,
+                'checked_in' => false,
+            ];
+            clearStep($steps, $userId);
+            $extraKb = [];
+            if (($event['status'] ?? '') === 'CHECKIN') {
+                $extraKb[] = [['text' => '✅ Check-in', 'callback_data' => 'checkin_event_' . $code]];
+            }
+            tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => eventViewText($code, $events[$code], $participants[$code]['squads'][$mySquadId]), 'parse_mode' => 'HTML', 'reply_markup' => kb($extraKb ?: [[['text' => '🔙 Menu', 'callback_data' => 'squad_menu']]])]);
+            return;
+
+        case 'squad_create_name':
+            $steps[(string)$userId] = ['step' => 'squad_create_pubg_id', 'temp' => ['name' => mb_substr($text, 0, 64)]];
+            tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Captain PUBG ID kiriting:']);
+            return;
+
+        case 'squad_create_pubg_id':
+            $temp['pubg_id'] = mb_substr($text, 0, 64);
+            $steps[(string)$userId] = ['step' => 'squad_create_nick', 'temp' => $temp];
+            tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Captain nick kiriting:']);
+            return;
+
+        case 'squad_create_nick':
+            if (userSquadId($userId, $squadMembers) !== null) {
+                clearStep($steps, $userId);
+                tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Siz allaqachon squad ichidasiz.']);
+                return;
+            }
+            $squadId = makeSquadId($squads);
+            $invite = makeInviteCode($squads);
+            $name = (string)($temp['name'] ?? 'Unnamed');
+            $pubg = (string)($temp['pubg_id'] ?? '');
+            $nick = mb_substr($text, 0, 64);
+
+            $squads[$squadId] = ['squad_id' => $squadId, 'captain_id' => $userId, 'name' => $name, 'invite_code' => $invite, 'created_at' => now(), 'updated_at' => now()];
+            $squadMembers[$squadId] = ['captain_id' => $userId, 'members' => [
+                (string)$userId => ['user_id' => $userId, 'role' => 'captain', 'pubg_id' => $pubg, 'nick' => $nick, 'joined_at' => now()]
+            ]];
+            clearStep($steps, $userId);
+            tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => "✅ Squad yaratildi!\nSquad ID: <b>{$squadId}</b>\nInvite code: <b>{$invite}</b>\nInvite link: <code>https://t.me/{$botUsername}?start=sq_{$invite}</code>\nO‘yinchilar link orqali kiradi yoki squad ID orqali.", 'parse_mode' => 'HTML']);
+            sendSquadView($token, $chatId, $userId, $botUsername, $squads, $squadMembers);
+            return;
+
+        case 'squad_join_code':
+            $code = strtoupper($text);
+            $squadId = findSquadByCode($code, $squads);
+            if ($squadId === null) {
+                tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Squad topilmadi.']);
+                return;
+            }
+            if (userSquadId($userId, $squadMembers) !== null) {
+                clearStep($steps, $userId);
+                tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Siz allaqachon squad ichidasiz.']);
+                return;
+            }
+            if (count($squadMembers[$squadId]['members'] ?? []) >= 4) {
+                tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Squad to‘lgan (4/4).']);
+                return;
+            }
+            $steps[(string)$userId] = ['step' => 'squad_join_pubg_id', 'temp' => ['squad_id' => $squadId]];
+            tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'PUBG ID kiriting:']);
+            return;
+
+        case 'squad_join_pubg_id':
+            $temp['pubg_id'] = mb_substr($text, 0, 64);
+            $steps[(string)$userId] = ['step' => 'squad_join_nick', 'temp' => $temp];
+            tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Nick kiriting:']);
+            return;
+
+        case 'squad_join_nick':
+            $squadId = (string)($temp['squad_id'] ?? '');
+            if (!isset($squadMembers[$squadId])) {
+                clearStep($steps, $userId);
+                tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Squad topilmadi.']);
+                return;
+            }
+            if (count($squadMembers[$squadId]['members']) >= 4) {
+                clearStep($steps, $userId);
+                tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Squad to‘lgan (4/4).']);
+                return;
+            }
+            $squadMembers[$squadId]['members'][(string)$userId] = [
+                'user_id' => $userId,
+                'role' => 'member',
+                'pubg_id' => (string)($temp['pubg_id'] ?? ''),
+                'nick' => mb_substr($text, 0, 64),
+                'joined_at' => now(),
+            ];
+            $squads[$squadId]['updated_at'] = now();
+            clearStep($steps, $userId);
+            tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => '✅ Squadga qo‘shildingiz.']);
+            sendSquadView($token, $chatId, $userId, $botUsername, $squads, $squadMembers);
+            return;
+
+        case 'admin_create_code':
+            if (!isAdmin($userId, $admins)) return;
+            $code = strtoupper(preg_replace('/[^A-Z0-9_-]/', '', $text));
+            if ($code === '' || isset($events[$code])) {
+                tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Kod xato yoki band.']);
+                return;
+            }
+            $steps[(string)$userId] = ['step' => 'admin_create_title', 'temp' => ['code' => $code]];
+            tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Event title kiriting:']);
+            return;
+
+        case 'admin_create_title':
+            if (!isAdmin($userId, $admins)) return;
+            $temp['title'] = mb_substr($text, 0, 100);
+            $steps[(string)$userId] = ['step' => 'admin_create_datetime', 'temp' => $temp];
+            tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Event datetime text kiriting:']);
+            return;
+
+        case 'admin_create_datetime':
+            if (!isAdmin($userId, $admins)) return;
+            $temp['datetime_text'] = mb_substr($text, 0, 100);
+            $steps[(string)$userId] = ['step' => 'admin_create_limit', 'temp' => $temp];
+            tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Limit squads kiriting (bo‘sh qoldirsangiz 16):']);
+            return;
+
+        case 'admin_create_limit':
+            if (!isAdmin($userId, $admins)) return;
+            $limit = (int)$text;
+            if ($limit <= 0) $limit = 16;
+            $code = (string)($temp['code'] ?? '');
+            if ($code === '') return;
+            $events[$code] = [
+                'code' => $code,
+                'title' => (string)($temp['title'] ?? $code),
+                'datetime_text' => (string)($temp['datetime_text'] ?? ''),
+                'limit_squads' => $limit,
+                'status' => 'OPEN',
+                'created_at' => now(),
+                'updated_at' => now(),
+                'room_id' => null,
+                'room_password' => null,
+                'room_start_time' => null,
+            ];
+            clearStep($steps, $userId);
+            tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => "✅ Event yaratildi: {$code}"]);
+            return;
+
+        case 'admin_room_id':
+            if (!isAdmin($userId, $admins)) return;
+            $temp['room_id'] = mb_substr($text, 0, 100);
+            $steps[(string)$userId] = ['step' => 'admin_room_pass', 'temp' => $temp];
+            tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Room password kiriting:']);
+            return;
+
+        case 'admin_room_pass':
+            if (!isAdmin($userId, $admins)) return;
+            $temp['room_password'] = mb_substr($text, 0, 100);
+            $steps[(string)$userId] = ['step' => 'admin_room_time', 'temp' => $temp];
+            tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Room start time kiriting:']);
+            return;
+
+        case 'admin_room_time':
+            if (!isAdmin($userId, $admins)) return;
+            $eventCode = (string)($temp['event_code'] ?? '');
+            if (!isset($events[$eventCode])) return;
+            $events[$eventCode]['room_id'] = (string)($temp['room_id'] ?? '');
+            $events[$eventCode]['room_password'] = (string)($temp['room_password'] ?? '');
+            $events[$eventCode]['room_start_time'] = mb_substr($text, 0, 100);
+            $events[$eventCode]['updated_at'] = now();
+            clearStep($steps, $userId);
+            tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => '✅ Room ma’lumotlari saqlandi.']);
+            return;
+
+        case 'admin_score_points':
+            if (!isAdmin($userId, $admins)) return;
+            $temp['points'] = (int)$text;
+            $steps[(string)$userId] = ['step' => 'admin_score_kills', 'temp' => $temp];
+            tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Kills kiriting (yoki skip):']);
+            return;
+
+        case 'admin_score_kills':
+            if (!isAdmin($userId, $admins)) return;
+            $eventCode = (string)($temp['event_code'] ?? '');
+            $squadId = (string)($temp['squad_id'] ?? '');
+            if ($eventCode === '' || $squadId === '') return;
+            $kills = strtolower($text) === 'skip' ? null : (int)$text;
+            $scores[$eventCode] = $scores[$eventCode] ?? ['squads' => []];
+            $scores[$eventCode]['squads'][$squadId] = ['points' => (int)($temp['points'] ?? 0), 'kills' => $kills, 'updated_at' => now()];
+            clearStep($steps, $userId);
+            tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => '✅ Score saqlandi.']);
+            return;
+
+        case 'admin_broadcast_text':
+            if (!isAdmin($userId, $admins)) return;
+            $target = (string)($temp['target'] ?? 'all');
+            $sent = 0;
+            $failed = 0;
+            $uids = [];
+            if ($target === 'all') {
+                $uids = array_map('intval', array_keys($users));
+            } else {
+                $eventCode = (string)($temp['event_code'] ?? '');
+                $uids = gatherEventUserIds($eventCode, $participants, $squadMembers);
+            }
+            foreach ($uids as $uid) {
+                $res = tg($token, 'sendMessage', ['chat_id' => $uid, 'text' => $text, 'parse_mode' => 'HTML']);
+                if (($res['ok'] ?? false) === true) $sent++; else $failed++;
+                usleep(30000);
+            }
+            clearStep($steps, $userId);
+            tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => "Broadcast tugadi. Sent: {$sent}, Failed: {$failed}"]);
+            return;
+    }
+}
+
+function handleCallback(string $token, int $chatId, int $msgId, int $userId, string $data, string $botUsername, array $requiredChannels, array $admins, string $supportUsername, array &$users, array &$steps, array &$squads, array &$squadMembers, array &$events, array &$participants, array &$scores, array $files): void
+{
+    $isAdmin = isAdmin($userId, $admins);
+
+    if ($data === 'check_sub') {
+        if (ensureSubscribed($token, $userId, $requiredChannels)) {
+            editText($token, $chatId, $msgId, '✅ Obuna tasdiqlandi.', mainMenuKb($isAdmin));
+        } else {
+            editText($token, $chatId, $msgId, subText($requiredChannels), kb([[['text' => '✅ Tekshirish', 'callback_data' => 'check_sub']]]));
+        }
+        return;
+    }
+
+    if ($data === 'squad_menu' || $data === 'm_squad') {
+        sendSquadMenuEdit($token, $chatId, $msgId, $userId, $botUsername, $squads, $squadMembers);
+        return;
+    }
+
+    if ($data === 'm_join') {
+        if (!ensureSubscribed($token, $userId, $requiredChannels)) {
+            editText($token, $chatId, $msgId, subText($requiredChannels), kb([[['text' => '✅ Tekshirish', 'callback_data' => 'check_sub']]]));
+            return;
+        }
+        $refCount = (int)($users[(string)$userId]['referral_count'] ?? 0);
+        if ($refCount < 3) {
+            editText($token, $chatId, $msgId, '3 ta referal talab qilinadi.', kb([[['text' => '🎁 Referal', 'callback_data' => 'm_ref']]]));
+            return;
+        }
+        $squadId = userSquadId($userId, $squadMembers);
+        if ($squadId === null) {
+            editText($token, $chatId, $msgId, 'Avval squad yarating yoki qo‘shiling.', kb([[['text' => '👥 Squad', 'callback_data' => 'm_squad']]]));
+            return;
+        }
+        if (count($squadMembers[$squadId]['members'] ?? []) < 4) {
+            editText($token, $chatId, $msgId, 'Squad 4 ta odam bo‘lishi shart.', kb([[['text' => '👥 Squad', 'callback_data' => 'm_squad']]]));
+            return;
+        }
+        $steps[(string)$userId] = ['step' => 'enter_event_code', 'temp' => []];
+        editText($token, $chatId, $msgId, 'Event code kiriting:');
+        return;
+    }
+
+    if ($data === 'm_enter_code') {
+        if (!ensureSubscribed($token, $userId, $requiredChannels)) {
+            editText($token, $chatId, $msgId, subText($requiredChannels), kb([[['text' => '✅ Tekshirish', 'callback_data' => 'check_sub']]]));
+            return;
+        }
+        $steps[(string)$userId] = ['step' => 'enter_event_code', 'temp' => []];
+        editText($token, $chatId, $msgId, 'Event code kiriting:');
+        return;
+    }
+
+    if ($data === 'm_results') {
+        $rows = [];
+        $list = array_values($events);
+        usort($list, fn($a, $b) => strcmp((string)($b['created_at'] ?? ''), (string)($a['created_at'] ?? '')));
+        foreach (array_slice($list, 0, 10) as $ev) {
+            $code = (string)$ev['code'];
+            $rows[] = [['text' => $code . ' - ' . mb_substr((string)$ev['title'], 0, 20), 'callback_data' => 'ev_pick_' . $code]];
+        }
+        $rows[] = [['text' => '🔙 Menu', 'callback_data' => 'squad_menu']];
+        editText($token, $chatId, $msgId, 'Oxirgi eventlar:', kb($rows));
+        return;
+    }
+
+    if (str_starts_with($data, 'ev_pick_')) {
+        $code = substr($data, 8);
+        $txt = "<b>{$code} natijalari</b>\n";
+        $scoreRows = [];
+        foreach (($scores[$code]['squads'] ?? []) as $sid => $sc) {
+            $name = (string)($squads[$sid]['name'] ?? $sid);
+            $scoreRows[] = ['name' => $name, 'points' => (int)($sc['points'] ?? 0), 'kills' => $sc['kills'] ?? null];
+        }
+        usort($scoreRows, fn($a, $b) => ($b['points'] <=> $a['points']));
+        if ($scoreRows) {
+            $rank = 1;
+            foreach ($scoreRows as $r) {
+                $k = $r['kills'] === null ? '-' : (string)$r['kills'];
+                $txt .= "{$rank}. " . h($r['name']) . " | {$r['points']} pts | {$k} kills\n";
+                $rank++;
+            }
+        } else {
+            $txt .= "Score kiritilmagan.\nRo'yxatdan o'tgan squadlar:\n";
+            foreach (($participants[$code]['squads'] ?? []) as $p) {
+                $txt .= '- ' . h((string)($p['squad_name_snapshot'] ?? '')) . "\n";
+            }
+        }
+        editText($token, $chatId, $msgId, $txt, kb([[['text' => '🔙 Back', 'callback_data' => 'm_results']]]), true);
+        return;
+    }
+
+    if ($data === 'm_ref') {
+        $count = (int)($users[(string)$userId]['referral_count'] ?? 0);
+        $remain = max(0, 3 - $count);
+        $link = "https://t.me/{$botUsername}?start=ref_{$userId}";
+        $txt = "<b>Referral</b>\nLink: <code>{$link}</code>\nCount: {$count}\nRemaining: {$remain}";
+        editText($token, $chatId, $msgId, $txt, kb([[['text' => '🔙 Menu', 'callback_data' => 'squad_menu']]]), true);
+        return;
+    }
+
+    if ($data === 'm_rules') {
+        editText($token, $chatId, $msgId, "1) Fair play\n2) Toxic taqiqlanadi\n3) Check-in vaqtida bo‘ling", kb([[['text' => '🔙 Menu', 'callback_data' => 'squad_menu']]]));
+        return;
+    }
+
+    if ($data === 'm_support') {
+        editText($token, $chatId, $msgId, "Support: {$supportUsername}", kb([[['text' => '🔙 Menu', 'callback_data' => 'squad_menu']]]));
+        return;
+    }
+
+    if ($data === 'm_admin' || $data === 'admin_panel') {
+        if (!$isAdmin) return;
+        sendAdminPanel($token, $chatId, $msgId);
+        return;
+    }
+
+    if ($data === 'squad_create') {
+        if (userSquadId($userId, $squadMembers) !== null) {
+            editText($token, $chatId, $msgId, 'Siz allaqachon squad ichidasiz.');
+            return;
+        }
+        $steps[(string)$userId] = ['step' => 'squad_create_name', 'temp' => []];
+        editText($token, $chatId, $msgId, 'Squad nomini kiriting:');
+        return;
+    }
+
+    if ($data === 'squad_join') {
+        if (userSquadId($userId, $squadMembers) !== null) {
+            editText($token, $chatId, $msgId, 'Siz allaqachon squad ichidasiz.');
+            return;
+        }
+        $steps[(string)$userId] = ['step' => 'squad_join_code', 'temp' => []];
+        editText($token, $chatId, $msgId, 'Squad ID yoki invite code kiriting:');
+        return;
+    }
+
+    if ($data === 'squad_view') {
+        sendSquadViewEdit($token, $chatId, $msgId, $userId, $botUsername, $squads, $squadMembers);
+        return;
+    }
+
+    if ($data === 'squad_leave') {
+        $sid = userSquadId($userId, $squadMembers);
+        if ($sid === null) return;
+        if ((int)($squads[$sid]['captain_id'] ?? 0) === $userId) {
+            editText($token, $chatId, $msgId, 'Captain squadni tark eta olmaydi, squadni o‘chiring.');
+            return;
+        }
+        unset($squadMembers[$sid]['members'][(string)$userId]);
+        $squads[$sid]['updated_at'] = now();
+        editText($token, $chatId, $msgId, 'Squaddan chiqdingiz.', kb([[['text' => '👥 Squad', 'callback_data' => 'm_squad']]]));
+        return;
+    }
+
+    if ($data === 'squad_kick_menu') {
+        $sid = userSquadId($userId, $squadMembers);
+        if ($sid === null || (int)($squads[$sid]['captain_id'] ?? 0) !== $userId) return;
+        $rows = [];
+        foreach (($squadMembers[$sid]['members'] ?? []) as $uid => $mem) {
+            if ((int)$uid === $userId) continue;
+            $rows[] = [['text' => '👢 ' . (string)($mem['nick'] ?? $uid), 'callback_data' => 'squad_kick_' . $uid]];
+        }
+        $rows[] = [['text' => '🔙 Back', 'callback_data' => 'm_squad']];
+        editText($token, $chatId, $msgId, 'Kick uchun a’zoni tanlang:', kb($rows));
+        return;
+    }
+
+    if (str_starts_with($data, 'squad_kick_')) {
+        $kickId = (int)substr($data, 11);
+        $sid = userSquadId($userId, $squadMembers);
+        if ($sid === null || (int)($squads[$sid]['captain_id'] ?? 0) !== $userId || $kickId === $userId) return;
+        unset($squadMembers[$sid]['members'][(string)$kickId]);
+        $squads[$sid]['updated_at'] = now();
+        editText($token, $chatId, $msgId, 'Member kicked.', kb([[['text' => '🔙 Squad', 'callback_data' => 'm_squad']]]));
+        return;
+    }
+
+    if ($data === 'squad_delete') {
+        $sid = userSquadId($userId, $squadMembers);
+        if ($sid === null || (int)($squads[$sid]['captain_id'] ?? 0) !== $userId) return;
+        editText($token, $chatId, $msgId, 'Squadni o‘chirasizmi?', kb([
+            [['text' => '✅ Ha', 'callback_data' => 'squad_delete_yes']],
+            [['text' => '❌ Yo‘q', 'callback_data' => 'squad_delete_no']],
+        ]));
+        return;
+    }
+
+    if ($data === 'squad_delete_no') {
+        sendSquadMenuEdit($token, $chatId, $msgId, $userId, $botUsername, $squads, $squadMembers);
+        return;
+    }
+
+    if ($data === 'squad_delete_yes') {
+        $sid = userSquadId($userId, $squadMembers);
+        if ($sid === null || (int)($squads[$sid]['captain_id'] ?? 0) !== $userId) return;
+        unset($squads[$sid], $squadMembers[$sid]);
+        foreach ($participants as $evCode => &$pp) {
+            unset($pp['squads'][$sid]);
+        }
+        unset($pp);
+        editText($token, $chatId, $msgId, '✅ Squad o‘chirildi.', kb([[['text' => '👥 Squad', 'callback_data' => 'm_squad']]]));
+        return;
+    }
+
+    if (str_starts_with($data, 'checkin_event_')) {
+        $code = substr($data, 13);
+        $sid = userSquadId($userId, $squadMembers);
+        if ($sid === null || !isset($participants[$code]['squads'][$sid])) return;
+        $participants[$code]['squads'][$sid]['checked_in'] = true;
+        editText($token, $chatId, $msgId, '✅ Check-in bajarildi.');
+        return;
+    }
+
+    // Admin routes
+    if (!$isAdmin) return;
+
+    if ($data === 'a_create') {
+        $steps[(string)$userId] = ['step' => 'admin_create_code', 'temp' => []];
+        editText($token, $chatId, $msgId, 'Event code kiriting:');
+        return;
+    }
+
+    if ($data === 'a_list') {
+        $txt = "<b>Eventlar</b>\n";
+        foreach ($events as $ev) {
+            $txt .= h((string)$ev['code']) . ' | ' . h((string)$ev['title']) . ' | ' . h((string)$ev['status']) . "\n";
+        }
+        editText($token, $chatId, $msgId, $txt, kb([[['text' => '🔙 Admin', 'callback_data' => 'admin_panel']]]), true);
+        return;
+    }
+
+    if (in_array($data, ['a_status', 'a_participants', 'a_room_set', 'a_room_send', 'a_scores', 'a_export'], true)) {
+        $action = $data;
+        $rows = [];
+        foreach ($events as $code => $ev) {
+            $rows[] = [['text' => $code . ' (' . (string)($ev['status'] ?? '') . ')', 'callback_data' => 'a_ev_' . $action . '_' . $code]];
+        }
+        $rows[] = [['text' => '🔙 Admin', 'callback_data' => 'admin_panel']];
+        editText($token, $chatId, $msgId, 'Event tanlang:', kb($rows));
+        return;
+    }
+
+    if (str_starts_with($data, 'a_ev_')) {
+        $parts = explode('_', $data, 4);
+        if (count($parts) < 4) return;
+        $action = $parts[2];
+        $code = $parts[3];
+
+        if ($action === 'a') return;
+
+        if ($action === 'a') return;
+
+        if ($action === 'status' || $parts[2] === 'a' || str_contains($data, 'a_status')) {
+            // unused fallback
+        }
+
+        if (str_starts_with($data, 'a_ev_a_status_')) {
+            $code = substr($data, strlen('a_ev_a_status_'));
+            editText($token, $chatId, $msgId, "Status: {$code}", kb([
+                [['text' => 'OPEN', 'callback_data' => 'status_open_' . $code]],
+                [['text' => 'CLOSED', 'callback_data' => 'status_closed_' . $code]],
+                [['text' => 'CHECKIN', 'callback_data' => 'status_checkin_' . $code]],
+                [['text' => 'LIVE', 'callback_data' => 'status_live_' . $code]],
+                [['text' => 'FINISHED', 'callback_data' => 'status_finished_' . $code]],
+            ]));
+            return;
+        }
+
+        if (str_starts_with($data, 'a_ev_a_participants_')) {
+            $code = substr($data, strlen('a_ev_a_participants_'));
+            $txt = "<b>{$code} participants</b>\n";
+            foreach (($participants[$code]['squads'] ?? []) as $s) {
+                $ci = !empty($s['checked_in']) ? '✅' : '❌';
+                $txt .= h((string)($s['squad_name_snapshot'] ?? '')) . " {$ci}\n";
+            }
+            editText($token, $chatId, $msgId, $txt, kb([[['text' => '🔙 Admin', 'callback_data' => 'admin_panel']]]), true);
+            return;
+        }
+
+        if (str_starts_with($data, 'a_ev_a_room_set_')) {
+            $code = substr($data, strlen('a_ev_a_room_set_'));
+            $steps[(string)$userId] = ['step' => 'admin_room_id', 'temp' => ['event_code' => $code]];
+            editText($token, $chatId, $msgId, 'Room ID kiriting:');
+            return;
+        }
+
+        if (str_starts_with($data, 'a_ev_a_room_send_')) {
+            $code = substr($data, strlen('a_ev_a_room_send_'));
+            $ev = $events[$code] ?? null;
+            if (!$ev) return;
+            $sent = 0;
+            foreach (($participants[$code]['squads'] ?? []) as $sid => $p) {
+                if (empty($p['checked_in'])) continue;
+                $captain = (int)($p['captain_id'] ?? 0);
+                if ($captain <= 0) continue;
+                $txt = "<b>Room Info {$code}</b>\nRoom ID: <code>" . h((string)($ev['room_id'] ?? '')) . "</code>\nPassword: <code>" . h((string)($ev['room_password'] ?? '')) . "</code>\nStart: " . h((string)($ev['room_start_time'] ?? ''));
+                tg($token, 'sendMessage', ['chat_id' => $captain, 'text' => $txt, 'parse_mode' => 'HTML']);
+                $sent++;
+            }
+            editText($token, $chatId, $msgId, "Room info yuborildi: {$sent}");
+            return;
+        }
+
+        if (str_starts_with($data, 'a_ev_a_scores_')) {
+            $code = substr($data, strlen('a_ev_a_scores_'));
+            $rows = [];
+            foreach (($participants[$code]['squads'] ?? []) as $sid => $p) {
+                $rows[] = [['text' => (string)($p['squad_name_snapshot'] ?? $sid), 'callback_data' => 'a_score_pick_' . $code . '_' . $sid]];
+            }
+            $rows[] = [['text' => '🔙 Admin', 'callback_data' => 'admin_panel']];
+            editText($token, $chatId, $msgId, 'Squad tanlang:', kb($rows));
+            return;
+        }
+
+        if (str_starts_with($data, 'a_ev_a_export_')) {
+            $code = substr($data, strlen('a_ev_a_export_'));
+            $csvPath = exportCsv($code, $events, $participants, $squads, $squadMembers, $scores, $users, __DIR__);
+            if ($csvPath) {
+                tg($token, 'sendDocument', ['chat_id' => $chatId, 'document' => curl_file_create($csvPath), 'caption' => "Export {$code}"]);
+            }
+            return;
+        }
+    }
+
+    if (str_starts_with($data, 'status_open_') || str_starts_with($data, 'status_closed_') || str_starts_with($data, 'status_checkin_') || str_starts_with($data, 'status_live_') || str_starts_with($data, 'status_finished_')) {
+        [$prefix, $status, $code] = explode('_', $data, 3);
+        $statusMap = [
+            'open' => 'OPEN',
+            'closed' => 'CLOSED',
+            'checkin' => 'CHECKIN',
+            'live' => 'LIVE',
+            'finished' => 'FINISHED',
+        ];
+        if (isset($events[$code]) && isset($statusMap[$status])) {
+            $events[$code]['status'] = $statusMap[$status];
+            $events[$code]['updated_at'] = now();
+            editText($token, $chatId, $msgId, "✅ Status yangilandi: {$code} => {$statusMap[$status]}");
+        }
+        return;
+    }
+
+    if (str_starts_with($data, 'a_score_pick_')) {
+        $tmp = substr($data, strlen('a_score_pick_'));
+        [$code, $sid] = explode('_', $tmp, 2);
+        $steps[(string)$userId] = ['step' => 'admin_score_points', 'temp' => ['event_code' => $code, 'squad_id' => $sid]];
+        editText($token, $chatId, $msgId, 'Points kiriting:');
+        return;
+    }
+
+    if ($data === 'a_broadcast') {
+        editText($token, $chatId, $msgId, 'Target tanlang:', kb([
+            [['text' => 'ALL USERS', 'callback_data' => 'a_broadcast_all']],
+            [['text' => 'EVENT USERS', 'callback_data' => 'a_broadcast_event']],
+        ]));
+        return;
+    }
+
+    if ($data === 'a_broadcast_all') {
+        $steps[(string)$userId] = ['step' => 'admin_broadcast_text', 'temp' => ['target' => 'all']];
+        editText($token, $chatId, $msgId, 'Yuboriladigan matnni kiriting (HTML):');
+        return;
+    }
+
+    if ($data === 'a_broadcast_event') {
+        $rows = [];
+        foreach ($events as $code => $ev) {
+            $rows[] = [['text' => $code, 'callback_data' => 'a_broadcast_event_' . $code]];
+        }
+        editText($token, $chatId, $msgId, 'Event tanlang:', kb($rows));
+        return;
+    }
+
+    if (str_starts_with($data, 'a_broadcast_event_')) {
+        $code = substr($data, strlen('a_broadcast_event_'));
+        $steps[(string)$userId] = ['step' => 'admin_broadcast_text', 'temp' => ['target' => 'event', 'event_code' => $code]];
+        editText($token, $chatId, $msgId, "{$code} uchun matn kiriting (HTML):");
+        return;
+    }
+
+    // default menu
+    if (in_array($data, ['squad_menu'], true)) {
+        sendMainMenu($token, $chatId, $userId, $admins);
+    }
+}
+
+// =========================
+// UI
+// =========================
+function sendMainMenu(string $token, int $chatId, int $userId, array $admins): void
+{
+    tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Asosiy menu:', 'reply_markup' => mainMenuKb(isAdmin($userId, $admins))]);
+}
+
+function mainMenuKb(bool $isAdmin): string
+{
+    $rows = [
+        [['text' => '🏆 Turnirga qo‘shilish', 'callback_data' => 'm_join']],
+        [['text' => '🎫 Event kod kiritish', 'callback_data' => 'm_enter_code']],
+        [['text' => '👥 Squad', 'callback_data' => 'm_squad']],
+        [['text' => '📊 Natijalar', 'callback_data' => 'm_results']],
+        [['text' => '🎁 Referal', 'callback_data' => 'm_ref']],
+        [['text' => '📜 Qoidalar', 'callback_data' => 'm_rules']],
+        [['text' => '☎️ Support', 'callback_data' => 'm_support']],
+    ];
+    if ($isAdmin) {
+        $rows[] = [['text' => '🛠 Admin Panel', 'callback_data' => 'm_admin']];
+    }
+    return kb($rows);
+}
+
+function sendAdminPanel(string $token, int $chatId, ?int $msgId = null): void
+{
+    $kb = kb([
+        [['text' => '➕ Create Event', 'callback_data' => 'a_create']],
+        [['text' => '📋 List Events', 'callback_data' => 'a_list']],
+        [['text' => '🔄 Change Status', 'callback_data' => 'a_status']],
+        [['text' => '👥 Participants', 'callback_data' => 'a_participants']],
+        [['text' => '🏠 Set Room Info', 'callback_data' => 'a_room_set']],
+        [['text' => '📤 Send Room Info', 'callback_data' => 'a_room_send']],
+        [['text' => '🧮 Enter Scores', 'callback_data' => 'a_scores']],
+        [['text' => '📣 Broadcast', 'callback_data' => 'a_broadcast']],
+        [['text' => '📤 Export CSV', 'callback_data' => 'a_export']],
+    ]);
+    if ($msgId) editText($token, $chatId, $msgId, 'Admin panel', $kb);
+    else tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Admin panel', 'reply_markup' => $kb]);
+}
+
+function sendSquadMenuEdit(string $token, int $chatId, int $msgId, int $userId, string $botUsername, array $squads, array $squadMembers): void
+{
+    $sid = userSquadId($userId, $squadMembers);
+    if ($sid === null) {
+        editText($token, $chatId, $msgId, 'Squad menyu', kb([
+            [['text' => '➕ Squad yaratish', 'callback_data' => 'squad_create']],
+            [['text' => '➕ Jamoaga qo‘shilish', 'callback_data' => 'squad_join']],
+            [['text' => '🔙 Menu', 'callback_data' => 'squad_menu']],
+        ]));
+        return;
+    }
+
+    sendSquadViewEdit($token, $chatId, $msgId, $userId, $botUsername, $squads, $squadMembers);
+}
+
+function sendSquadView(string $token, int $chatId, int $userId, string $botUsername, array $squads, array $squadMembers): void
+{
+    $sid = userSquadId($userId, $squadMembers);
+    if ($sid === null) {
+        tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => 'Squad topilmadi.']);
+        return;
+    }
+    tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => squadText($sid, $userId, $botUsername, $squads, $squadMembers), 'parse_mode' => 'HTML', 'reply_markup' => squadKb($sid, $userId, $squads)]);
+}
+
+function sendSquadViewEdit(string $token, int $chatId, int $msgId, int $userId, string $botUsername, array $squads, array $squadMembers): void
+{
+    $sid = userSquadId($userId, $squadMembers);
+    if ($sid === null) {
+        editText($token, $chatId, $msgId, 'Siz squadga qo‘shilmagansiz.', kb([
+            [['text' => '➕ Squad yaratish', 'callback_data' => 'squad_create']],
+            [['text' => '➕ Jamoaga qo‘shilish', 'callback_data' => 'squad_join']],
+            [['text' => '🔙 Menu', 'callback_data' => 'squad_menu']],
+        ]));
+        return;
+    }
+    editText($token, $chatId, $msgId, squadText($sid, $userId, $botUsername, $squads, $squadMembers), squadKb($sid, $userId, $squads), true);
+}
+
+function squadText(string $sid, int $userId, string $botUsername, array $squads, array $squadMembers): string
+{
+    $s = $squads[$sid] ?? [];
+    $members = $squadMembers[$sid]['members'] ?? [];
+    $txt = "<b>" . h((string)($s['name'] ?? '')) . "</b>\n";
+    $txt .= "Squad ID: <code>{$sid}</code>\n";
+    $txt .= "A’zolar:\n";
+    foreach ($members as $m) {
+        $txt .= '- ' . h((string)($m['nick'] ?? '')) . ' (' . h((string)($m['role'] ?? 'member')) . ")\n";
+    }
+    if ((int)($s['captain_id'] ?? 0) === $userId) {
+        $inv = (string)($s['invite_code'] ?? '');
+        $txt .= "Invite link: <code>https://t.me/{$botUsername}?start=sq_{$inv}</code>\n";
+    }
+    return $txt;
+}
+
+function squadKb(string $sid, int $userId, array $squads): string
+{
+    $isCaptain = ((int)($squads[$sid]['captain_id'] ?? 0) === $userId);
+    $rows = [
+        [['text' => '📄 Squadni ko‘rish', 'callback_data' => 'squad_view']],
+    ];
+    if (!$isCaptain) {
+        $rows[] = [['text' => '🚪 Squaddan chiqish', 'callback_data' => 'squad_leave']];
+    }
+    if ($isCaptain) {
+        $rows[] = [['text' => '🗑 Squadni o‘chirish', 'callback_data' => 'squad_delete']];
+        $rows[] = [['text' => '👢 Kick member', 'callback_data' => 'squad_kick_menu']];
+    }
+    $rows[] = [['text' => '🔙 Menu', 'callback_data' => 'squad_menu']];
+    return kb($rows);
+}
+
+function sendSubscribeGate(string $token, int $chatId, array $channels): void
+{
+    tg($token, 'sendMessage', ['chat_id' => $chatId, 'text' => subText($channels), 'reply_markup' => kb([[['text' => '✅ Tekshirish', 'callback_data' => 'check_sub']]])]);
+}
+
+function subText(array $channels): string
+{
+    $txt = "Botdan foydalanish uchun quyidagi kanallarga obuna bo‘ling:\n";
+    foreach ($channels as $ch) {
+        $name = ltrim($ch, '@');
+        $txt .= "- https://t.me/{$name}\n";
+    }
+    return $txt;
+}
+
+function eventViewText(string $code, array $event, array $part): string
+{
+    return "<b>Event</b>\n"
+        . "Code: <code>" . h($code) . "</code>\n"
+        . "Title: " . h((string)($event['title'] ?? '')) . "\n"
+        . "Datetime: " . h((string)($event['datetime_text'] ?? '')) . "\n"
+        . "Status: " . h((string)($event['status'] ?? '')) . "\n"
+        . "Squad: " . h((string)($part['squad_name_snapshot'] ?? '')) . "\n"
+        . "Checked-in: " . (!empty($part['checked_in']) ? '✅' : '❌');
+}
+
+// =========================
+// CORE HELPERS
+// =========================
+function ensureStorage(string $dataDir, array $files): void
+{
+    if (!is_dir($dataDir)) {
+        mkdir($dataDir, 0777, true);
+    }
+    foreach ($files as $k => $path) {
+        if ($k === 'log') {
+            if (!file_exists($path)) file_put_contents($path, '');
+            continue;
+        }
+        if (!file_exists($path)) {
+            file_put_contents($path, json_encode(new stdClass(), JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+        }
+    }
+}
+
+function readJson(string $path): array
+{
+    $fp = fopen($path, 'c+');
+    if (!$fp) return [];
+    flock($fp, LOCK_SH);
+    $raw = stream_get_contents($fp);
+    flock($fp, LOCK_UN);
+    fclose($fp);
+    $arr = json_decode($raw ?: '{}', true);
+    return is_array($arr) ? $arr : [];
+}
+
+function writeJson(string $path, array $data): void
+{
+    $tmp = $path . '.tmp';
+    $fp = fopen($tmp, 'w');
+    if (!$fp) return;
+    flock($fp, LOCK_EX);
+    fwrite($fp, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+    fflush($fp);
+    flock($fp, LOCK_UN);
+    fclose($fp);
+    rename($tmp, $path);
+}
+
+function tg(string $token, string $method, array $params = []): array
+{
+    $url = "https://api.telegram.org/bot{$token}/{$method}";
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 20,
+        CURLOPT_POSTFIELDS => $params,
+    ]);
+    $res = curl_exec($ch);
+    curl_close($ch);
+    $decoded = json_decode((string)$res, true);
+    return is_array($decoded) ? $decoded : ['ok' => false];
+}
+
+function ensureSubscribed(string $token, int $userId, array $channels): bool
+{
+    foreach ($channels as $ch) {
+        $res = tg($token, 'getChatMember', ['chat_id' => $ch, 'user_id' => $userId]);
+        $st = $res['result']['status'] ?? '';
+        if (!in_array($st, ['member', 'administrator', 'creator'], true)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function answerCb(string $token, string $id, string $text = ''): void
+{
+    tg($token, 'answerCallbackQuery', ['callback_query_id' => $id, 'text' => $text]);
+}
+
+function editText(string $token, int $chatId, int $msgId, string $text, ?string $replyMarkup = null, bool $html = false): void
+{
+    $params = ['chat_id' => $chatId, 'message_id' => $msgId, 'text' => $text];
+    if ($replyMarkup) $params['reply_markup'] = $replyMarkup;
+    if ($html) $params['parse_mode'] = 'HTML';
+    $res = tg($token, 'editMessageText', $params);
+    if (($res['ok'] ?? false) !== true) {
+        unset($params['message_id']);
+        tg($token, 'sendMessage', $params);
+    }
+}
+
+function kb(array $inlineKeyboard): string
+{
+    return json_encode(['inline_keyboard' => $inlineKeyboard], JSON_UNESCAPED_UNICODE);
+}
+
+function isAdmin(int $uid, array $admins): bool
+{
+    return in_array($uid, $admins, true);
+}
+
+function now(): string
+{
+    return date('c');
+}
+
+function sanitizeText(string $t): string
+{
+    $t = trim($t);
+    if (mb_strlen($t) > 500) $t = mb_substr($t, 0, 500);
+    return $t;
+}
+
+function h(string $s): string
+{
+    return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+
+function ensureUser(array &$users, int $uid, array $from): void
+{
+    $key = (string)$uid;
+    if (!isset($users[$key])) {
+        $users[$key] = [
+            'user_id' => $uid,
+            'username' => (string)($from['username'] ?? ''),
+            'first_name' => (string)($from['first_name'] ?? ''),
+            'joined_at' => now(),
+            'referral_by' => null,
+            'referral_count' => 0,
+            'eligible' => false,
+        ];
+    } else {
+        $users[$key]['username'] = (string)($from['username'] ?? ($users[$key]['username'] ?? ''));
+        $users[$key]['first_name'] = (string)($from['first_name'] ?? ($users[$key]['first_name'] ?? ''));
+        $users[$key]['eligible'] = ((int)($users[$key]['referral_count'] ?? 0) >= 3);
+    }
+}
+
+function clearStep(array &$steps, int $uid): void
+{
+    $steps[(string)$uid] = ['step' => null, 'temp' => new stdClass()];
+}
+
+function userSquadId(int $uid, array $squadMembers): ?string
+{
+    foreach ($squadMembers as $sid => $data) {
+        if (isset($data['members'][(string)$uid])) return (string)$sid;
+    }
+    return null;
+}
+
+function makeSquadId(array $squads): string
+{
+    do {
+        $id = 'S' . strtoupper(substr(bin2hex(random_bytes(4)), 0, 6));
+    } while (isset($squads[$id]));
+    return $id;
+}
+
+function makeInviteCode(array $squads): string
+{
+    $existing = array_map(fn($s) => $s['invite_code'] ?? '', $squads);
+    do {
+        $code = 'JOIN-' . strtoupper(substr(bin2hex(random_bytes(4)), 0, 5));
+    } while (in_array($code, $existing, true));
+    return $code;
+}
+
+function findSquadByCode(string $code, array $squads): ?string
+{
+    $code = strtoupper(trim($code));
+    if (isset($squads[$code])) return $code;
+    foreach ($squads as $sid => $s) {
+        if (strtoupper((string)($s['invite_code'] ?? '')) === $code) return (string)$sid;
+    }
+    return null;
+}
+
+function gatherEventUserIds(string $eventCode, array $participants, array $squadMembers): array
+{
+    $ids = [];
+    foreach (($participants[$eventCode]['squads'] ?? []) as $sid => $p) {
+        foreach (($squadMembers[$sid]['members'] ?? []) as $uid => $m) {
+            $ids[(int)$uid] = true;
+        }
+    }
+    return array_map('intval', array_keys($ids));
+}
+
+function exportCsv(string $eventCode, array $events, array $participants, array $squads, array $squadMembers, array $scores, array $users, string $baseDir): ?string
+{
+    if (!isset($events[$eventCode])) return null;
+    $ev = $events[$eventCode];
+    $path = $baseDir . '/export_' . $eventCode . '_' . time() . '.csv';
+    $fp = fopen($path, 'w');
+    if (!$fp) return null;
+    fputcsv($fp, ['event_code','event_title','event_datetime','event_status','squad_id','squad_name','captain_id','captain_username','member_user_id','member_username','role','pubg_id','nick','checked_in','points','kills','registered_at']);
+
+    foreach (($participants[$eventCode]['squads'] ?? []) as $sid => $part) {
+        $captainId = (int)($part['captain_id'] ?? 0);
+        $captainUser = (string)($users[(string)$captainId]['username'] ?? '');
+        $score = $scores[$eventCode]['squads'][$sid] ?? ['points' => 0, 'kills' => null];
+
+        foreach (($squadMembers[$sid]['members'] ?? []) as $uid => $mem) {
+            fputcsv($fp, [
+                $eventCode,
+                (string)($ev['title'] ?? ''),
+                (string)($ev['datetime_text'] ?? ''),
+                (string)($ev['status'] ?? ''),
+                $sid,
+                (string)($part['squad_name_snapshot'] ?? ($squads[$sid]['name'] ?? '')),
+                $captainId,
+                $captainUser,
+                (int)$uid,
+                (string)($users[(string)$uid]['username'] ?? ''),
+                (string)($mem['role'] ?? ''),
+                (string)($mem['pubg_id'] ?? ''),
+                (string)($mem['nick'] ?? ''),
+                !empty($part['checked_in']) ? 1 : 0,
+                (int)($score['points'] ?? 0),
+                $score['kills'] ?? '',
+                (string)($part['registered_at'] ?? ''),
+            ]);
+        }
+    }
+
+    fclose($fp);
+    return $path;
+}
+
+function logLine(string $logPath, string $text): void
+{
+    file_put_contents($logPath, '[' . date('Y-m-d H:i:s') . '] ' . $text . PHP_EOL, FILE_APPEND);
+}
